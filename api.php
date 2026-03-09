@@ -4,9 +4,9 @@
 // ==========================================
 // Enter your CloudPanel database credentials here:
 $db_host = '127.0.0.1';
-$db_name = 'your_database_name';
-$db_user = 'your_database_user';
-$db_pass = 'your_database_password';
+$db_name = 'turboapi';
+$db_user = 'turboapi';
+$db_pass = 'hzO4AX2Z2qXrE2JqcTOA';
 
 // Redis configuration (Fast Memory Storage)
 $redis_host = '127.0.0.1';
