@@ -4,14 +4,19 @@
 // ==========================================
 // Enter your CloudPanel database credentials here:
 $db_host = '127.0.0.1';
-$db_name = 'turboapi';
-$db_user = 'turboapi';
-$db_pass = 'hzO4AX2Z2qXrE2JqcTOA';
+$db_name = 'your_database_name';
+$db_user = 'your_database_user';
+$db_pass = 'your_database_password';
 
 // Redis configuration (Fast Memory Storage)
 $redis_host = '127.0.0.1';
 $redis_port = 6379;
 $redis_prefix = 'tw_var_'; // Prefix to avoid key collisions
+
+// Determine base API URL for the Copy Link feature
+$protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off' || $_SERVER['SERVER_PORT'] == 443) ? "https://" : "http://";
+$domainName = $_SERVER['HTTP_HOST'];
+$api_url_base = rtrim($protocol . $domainName . '/' . ltrim(dirname($_SERVER['SCRIPT_NAME']), '/'), '/') . '/api.php';
 
 // Connect to MariaDB using PDO
 $mariadb_status = 'Disconnected';
@@ -54,45 +59,30 @@ $messageType = ''; // 'success' or 'error'
 // Handle form submissions
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = $_POST['action'] ?? '';
-    $name = $_POST['name'] ?? '';
+    $key = $_POST['var_key'] ?? '';
     
-    if ($action === 'add' || $action === 'edit') {
-        $value = $_POST['value'] ?? '';
-        $storage = $_POST['storage'] ?? 'mariadb';
+    if ($action === 'save') {
+        $value = $_POST['var_value'] ?? '';
         
-        if (trim($name) === '') {
-            $message = 'Variable name cannot be empty.';
+        if (trim($key) === '') {
+            $message = 'Variable key cannot be empty.';
             $messageType = 'error';
         } else {
             try {
-                if ($storage === 'redis') {
+                if ($pdo) {
+                    $stmt = $pdo->prepare("INSERT INTO variables (var_key, var_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE var_value = ?");
+                    $stmt->execute([$key, $value, $value]);
+                    
                     if ($redis) {
-                        $redis->set($redis_prefix . $name, $value);
-                        // cleanup db just in case
-                        if ($pdo) {
-                            $stmt = $pdo->prepare("DELETE FROM variables WHERE name = ?");
-                            $stmt->execute([$name]);
-                        }
-                        $message = "Variable '$name' saved to Redis successfully.";
-                        $messageType = 'success';
+                        $redis->set($redis_prefix . $key, $value);
+                        $message = "Variable '$key' saved to SSD and Memory successfully.";
                     } else {
-                        $message = 'Cannot save to Redis: Redis is not connected.';
-                        $messageType = 'error';
+                        $message = "Variable '$key' saved to SSD only (Redis offline).";
                     }
+                    $messageType = 'success';
                 } else {
-                    if ($pdo) {
-                        $stmt = $pdo->prepare("INSERT INTO variables (name, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = ?");
-                        $stmt->execute([$name, $value, $value]);
-                        // cleanup redis just in case
-                        if ($redis) {
-                            $redis->del($redis_prefix . $name);
-                        }
-                        $message = "Variable '$name' saved to MariaDB successfully.";
-                        $messageType = 'success';
-                    } else {
-                        $message = 'Cannot save to DB: MariaDB is not connected.';
-                        $messageType = 'error';
-                    }
+                    $message = 'Cannot save to DB: MariaDB is not connected.';
+                    $messageType = 'error';
                 }
             } catch (Exception $e) {
                 $message = 'Error saving variable: ' . $e->getMessage();
@@ -100,18 +90,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
         }
     } elseif ($action === 'delete') {
-        $storage = $_POST['storage'] ?? '';
         try {
-            if ($storage === 'redis' && $redis) {
-                $redis->del($redis_prefix . $name);
-                $message = "Redis variable '$name' deleted.";
-                $messageType = 'success';
-            } elseif ($storage === 'mariadb' && $pdo) {
-                $stmt = $pdo->prepare("DELETE FROM variables WHERE name = ?");
-                $stmt->execute([$name]);
-                $message = "MariaDB variable '$name' deleted.";
-                $messageType = 'success';
+            if ($pdo) {
+                $stmt = $pdo->prepare("DELETE FROM variables WHERE var_key = ?");
+                $stmt->execute([$key]);
             }
+            if ($redis) {
+                $redis->del($redis_prefix . $key);
+            }
+            $message = "Variable '$key' deleted from SSD & Memory.";
+            $messageType = 'success';
         } catch (Exception $e) {
             $message = 'Error deleting variable: ' . $e->getMessage();
             $messageType = 'error';
@@ -119,57 +107,37 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-// Fetch all variables to display
+// Fetch all variables to display from MariaDB (Source of Truth)
 $variables = [];
-
-// Fetch MariaDB variables
 if ($pdo && $mariadb_status === 'Connected') {
     try {
-        $stmt = $pdo->query("SELECT name, value, updated_at FROM variables ORDER BY name ASC");
+        $stmt = $pdo->query("SELECT var_key, var_value, updated_at FROM variables ORDER BY var_key ASC");
         while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
-            $variables[$row['name']] = [
-                'name' => $row['name'],
-                'value' => $row['value'],
-                'storage' => 'mariadb',
-                'updated_at' => $row['updated_at']
+            // Check if it exists in Memory too
+            $in_redis = false;
+            if ($redis && $redis->exists($redis_prefix . $row['var_key'])) {
+                $in_redis = true;
+            }
+            
+            $variables[] = [
+                'key' => $row['var_key'],
+                'value' => $row['var_value'],
+                'updated_at' => $row['updated_at'],
+                'in_redis' => $in_redis
             ];
         }
     } catch (PDOException $e) {
-        // Table might not exist yet
+        $message = "Table 'variables' not found. Please paste db_setup.sql into phpMyAdmin first.";
+        $messageType = "error";
     }
 }
-
-// Fetch Redis variables
-if ($redis && $redis_status === 'Connected') {
-    try {
-        $keys = $redis->keys($redis_prefix . '*');
-        if ($keys) {
-            foreach ($keys as $key) {
-                $name = substr($key, strlen($redis_prefix));
-                $value = $redis->get($key);
-                // Display as Redis since api prioritizes it
-                $variables[$name] = [
-                    'name' => $name,
-                    'value' => $value,
-                    'storage' => 'redis',
-                    'updated_at' => 'N/A (Memory)'
-                ];
-            }
-        }
-    } catch (Exception $e) {
-        // Handle redis errors quietly
-    }
-}
-
-// Sort compiled variables by name
-ksort($variables);
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Portable Variable Storage Service</title>
+    <title>Dual-Layer Variable Storage</title>
     <!-- Use Tailwind CSS for a highly premium, dark modern feel -->
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
@@ -218,18 +186,18 @@ ksort($variables);
     <div class="max-w-6xl mx-auto">
         <header class="flex flex-col md:flex-row justify-between items-center mb-10 pb-6 border-b border-slate-700">
             <div>
-                <h1 class="text-3xl font-extrabold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-indigo-500 mb-2">Variable Storage Service</h1>
-                <p class="text-slate-400 font-medium tracking-wide">Manage variables for TurboWarp / API</p>
+                <h1 class="text-3xl font-extrabold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-indigo-500 mb-2">Dual-Layer Variable Storage</h1>
+                <p class="text-slate-400 font-medium tracking-wide">TurboWarp SSD/Memory Sync Service</p>
             </div>
             
             <div class="flex flex-col gap-2 mt-4 md:mt-0 text-sm">
                 <div class="flex items-center gap-3 px-4 py-2 rounded-full bg-slate-800/80 border <?= $mariadb_status === 'Connected' ? 'border-green-500/50' : 'border-red-500/50' ?> shadow-lg">
                     <div class="w-3 h-3 rounded-full <?= $mariadb_status === 'Connected' ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.8)]' : 'bg-red-500 animate-pulse shadow-[0_0_8px_rgba(239,68,68,0.8)]' ?>"></div>
-                    <span class="text-slate-300 font-medium tracking-wider text-xs uppercase">MariaDB: <span class="<?= $mariadb_status === 'Connected' ? 'text-green-400' : 'text-red-400' ?>"><?= htmlspecialchars($mariadb_status) ?></span></span>
+                    <span class="text-slate-300 font-medium tracking-wider text-xs uppercase">SSD (MariaDB): <span class="<?= $mariadb_status === 'Connected' ? 'text-green-400' : 'text-red-400' ?>"><?= htmlspecialchars($mariadb_status) ?></span></span>
                 </div>
-                <div class="flex items-center gap-3 px-4 py-2 rounded-full bg-slate-800/80 border <?= $redis_status === 'Connected' ? 'border-green-500/50' : 'border-red-500/50' ?> shadow-lg">
+                <div class="flex items-center gap-3 px-4 py-2 rounded-full bg-slate-800/80 border <?= $redis_status === 'Connected' ? 'border-green-500/50' : 'border-yellow-500/50' ?> shadow-lg">
                     <div class="w-3 h-3 rounded-full <?= $redis_status === 'Connected' ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.8)]' : 'bg-yellow-500 animate-pulse shadow-[0_0_8px_rgba(234,179,8,0.8)]' ?>"></div>
-                    <span class="text-slate-300 font-medium tracking-wider text-xs uppercase">Redis: <span class="<?= $redis_status === 'Connected' ? 'text-green-400' : 'text-yellow-400' ?>"><?= htmlspecialchars($redis_status) ?></span></span>
+                    <span class="text-slate-300 font-medium tracking-wider text-xs uppercase">Memory (Redis): <span class="<?= $redis_status === 'Connected' ? 'text-green-400' : 'text-yellow-400' ?>"><?= htmlspecialchars($redis_status) ?></span></span>
                 </div>
             </div>
         </header>
@@ -251,49 +219,20 @@ ksort($variables);
                 <div id="form-panel" class="glass-panel p-6 rounded-2xl w-full sticky top-8">
                     <h2 class="text-xl font-bold mb-6 flex items-center gap-2">
                         <svg class="w-5 h-5 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
-                        <span id="form-title">Add / Edit Variable</span>
+                        <span id="form-title">Save Variable</span>
                     </h2>
                     
                     <form method="POST" action="">
-                        <input type="hidden" name="action" id="form-action" value="add">
+                        <input type="hidden" name="action" id="form-action" value="save">
                         
                         <div class="mb-5">
-                            <label class="block text-sm font-semibold text-slate-300 mb-2 uppercase tracking-wide" for="name">Variable Name</label>
-                            <input type="text" id="name" name="name" required placeholder="e.g. global_score" class="w-full px-4 py-3 rounded-xl placeholder-slate-500 font-mono text-sm" />
-                        </div>
-                        
-                        <div class="mb-5">
-                            <label class="block text-sm font-semibold text-slate-300 mb-2 uppercase tracking-wide" for="value">Value <span class="text-slate-500 text-xs normal-case font-normal">(String / JSON)</span></label>
-                            <textarea id="value" name="value" rows="5" class="w-full px-4 py-3 rounded-xl placeholder-slate-500 font-mono text-sm" placeholder="Enter data..."></textarea>
+                            <label class="block text-sm font-semibold text-slate-300 mb-2 uppercase tracking-wide" for="var_key">Variable Key</label>
+                            <input type="text" id="var_key" name="var_key" required placeholder="e.g. global_score" class="w-full px-4 py-3 rounded-xl placeholder-slate-500 font-mono text-sm" />
                         </div>
                         
                         <div class="mb-6">
-                            <label class="block text-sm font-semibold text-slate-300 mb-3 uppercase tracking-wide">Storage Target</label>
-                            <div class="flex gap-4">
-                                <label class="flex-1 cursor-pointer group relative">
-                                    <input type="radio" name="storage" value="mariadb" class="peer sr-only" checked>
-                                    <div class="p-3 text-center rounded-xl border border-slate-600 bg-slate-800/80 text-slate-400 peer-checked:border-blue-500 peer-checked:bg-blue-900/40 peer-checked:text-blue-300 hover:bg-slate-700/80 transition-all duration-200">
-                                        <div class="font-bold mb-1 flex items-center justify-center gap-1.5">
-                                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4"></path></svg>
-                                            MariaDB
-                                        </div>
-                                        <span class="text-[10px] uppercase tracking-wider opacity-75 block">Persistent</span>
-                                    </div>
-                                    <!-- glow effect on checked -->
-                                    <div class="absolute inset-0 rounded-xl bg-blue-500/20 blur-md -z-10 opacity-0 peer-checked:opacity-100 transition-opacity"></div>
-                                </label>
-                                <label class="flex-1 cursor-pointer group relative">
-                                    <input type="radio" name="storage" value="redis" class="peer sr-only">
-                                    <div class="p-3 text-center rounded-xl border border-slate-600 bg-slate-800/80 text-slate-400 peer-checked:border-indigo-500 peer-checked:bg-indigo-900/40 peer-checked:text-indigo-300 hover:bg-slate-700/80 transition-all duration-200">
-                                        <div class="font-bold mb-1 flex items-center justify-center gap-1.5">
-                                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
-                                            Redis
-                                        </div>
-                                        <span class="text-[10px] uppercase tracking-wider opacity-75 block">Fast Memory</span>
-                                    </div>
-                                    <div class="absolute inset-0 rounded-xl bg-indigo-500/20 blur-md -z-10 opacity-0 peer-checked:opacity-100 transition-opacity"></div>
-                                </label>
-                            </div>
+                            <label class="block text-sm font-semibold text-slate-300 mb-2 uppercase tracking-wide" for="var_value">Value <span class="text-slate-500 text-xs normal-case font-normal">(String / JSON)</span></label>
+                            <textarea id="var_value" name="var_value" rows="5" class="w-full px-4 py-3 rounded-xl placeholder-slate-500 font-mono text-sm" placeholder="Enter data..."></textarea>
                         </div>
                         
                         <div class="flex gap-3">
@@ -302,7 +241,7 @@ ksort($variables);
                             </button>
                             <button type="submit" id="btn-submit" class="flex-[2] w-full py-3 px-4 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white rounded-xl font-bold shadow-lg shadow-blue-500/25 transition-all transform active:scale-95 flex justify-center items-center gap-2">
                                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"></path></svg>
-                                Save Variable
+                                Save to SSD & Memory
                             </button>
                         </div>
                     </form>
@@ -326,9 +265,9 @@ ksort($variables);
                         <table class="w-full text-left border-collapse">
                             <thead class="bg-slate-900/60 text-slate-400 text-xs uppercase tracking-wider">
                                 <tr>
-                                    <th class="px-6 py-4 font-bold border-b border-slate-700/50">Name</th>
+                                    <th class="px-6 py-4 font-bold border-b border-slate-700/50">Key</th>
                                     <th class="px-6 py-4 font-bold border-b border-slate-700/50 w-2/5">Value</th>
-                                    <th class="px-6 py-4 font-bold border-b border-slate-700/50 text-center">Storage Target</th>
+                                    <th class="px-6 py-4 font-bold border-b border-slate-700/50 text-center">Status</th>
                                     <th class="px-6 py-4 font-bold border-b border-slate-700/50 text-right">Actions</th>
                                 </tr>
                             </thead>
@@ -344,38 +283,39 @@ ksort($variables);
                                     <?php foreach ($variables as $v): ?>
                                         <tr class="hover:bg-slate-800/50 transition-colors group">
                                             <td class="px-6 py-4">
-                                                <div class="font-mono text-sm text-blue-300 font-semibold mb-1"><?= htmlspecialchars($v['name']) ?></div>
-                                                <div class="text-[10px] text-slate-500 font-medium uppercase tracking-wider">Updated: <?= $v['updated_at'] ?></div>
+                                                <div class="font-mono text-sm text-blue-300 font-semibold mb-1"><?= htmlspecialchars($v['key']) ?></div>
+                                                <div class="text-[10px] text-slate-500 font-medium uppercase tracking-wider">Upd: <?= $v['updated_at'] ?></div>
                                             </td>
                                             <td class="px-6 py-4">
-                                                <div class="max-w-[250px] md:max-w-[300px] bg-slate-900/50 p-2.5 rounded-lg border border-slate-700/50 font-mono text-sm text-slate-300 overflow-hidden text-ellipsis whitespace-nowrap group-hover:bg-slate-900/80 transition-colors" title="<?= htmlspecialchars($v['value']) ?>">
+                                                <div class="max-w-[200px] md:max-w-[250px] bg-slate-900/50 p-2.5 rounded-lg border border-slate-700/50 font-mono text-sm text-slate-300 overflow-hidden text-ellipsis whitespace-nowrap group-hover:bg-slate-900/80 transition-colors" title="<?= htmlspecialchars($v['value']) ?>">
                                                     <?= htmlspecialchars($v['value']) ?>
                                                 </div>
                                             </td>
                                             <td class="px-6 py-4 text-center">
-                                                <?php if ($v['storage'] === 'redis'): ?>
-                                                    <span class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 text-xs font-bold uppercase tracking-wider">
-                                                        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
-                                                        Redis
+                                                <div class="flex flex-col gap-1 items-center">
+                                                    <span class="inline-flex items-center gap-1.5 px-2 py-1 rounded-md bg-blue-500/10 text-blue-400 border border-blue-500/20 text-[10px] font-bold uppercase tracking-wider w-16 justify-center" title="Saved permanently to MariaDB">
+                                                        SSD
                                                     </span>
-                                                <?php else: ?>
-                                                    <span class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-500/10 text-blue-400 border border-blue-500/20 text-xs font-bold uppercase tracking-wider">
-                                                        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4"></path></svg>
-                                                        MariaDB
-                                                    </span>
-                                                <?php endif; ?>
+                                                    <?php if ($v['in_redis']): ?>
+                                                        <span class="inline-flex items-center gap-1.5 px-2 py-1 rounded-md bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 text-[10px] font-bold uppercase tracking-wider w-16 justify-center" title="Cached in fast Redis memory">
+                                                            Memory
+                                                        </span>
+                                                    <?php endif; ?>
+                                                </div>
                                             </td>
                                             <td class="px-6 py-4 text-right">
                                                 <div class="flex items-center justify-end gap-2 opacity-60 group-hover:opacity-100 transition-opacity">
-                                                    <button type="button" onclick="editVar('<?= htmlspecialchars(addslashes($v['name'])) ?>', '<?= htmlspecialchars(addslashes($v['value'])) ?>', '<?= $v['storage'] ?>')" class="p-2.5 text-blue-400 bg-blue-400/5 hover:bg-blue-400/20 border border-transparent hover:border-blue-400/30 rounded-xl transition-all" title="Edit Variable">
-                                                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg>
+                                                    <button type="button" onclick="copyApiUrl('<?= htmlspecialchars(addslashes($api_url_base . '?action=pull&name=' . urlencode($v['key']))) ?>', this)" class="p-2 text-emerald-400 bg-emerald-400/5 hover:bg-emerald-400/20 border border-transparent hover:border-emerald-400/30 rounded-xl transition-all" title="Copy Pull Link">
+                                                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path></svg>
                                                     </button>
-                                                    <form method="POST" action="" class="inline-block m-0" onsubmit="return confirm('Are you sure you want to delete \'<?= htmlspecialchars(addslashes($v['name'])) ?>\'?');">
+                                                    <button type="button" onclick="editVar('<?= htmlspecialchars(addslashes($v['key'])) ?>', '<?= htmlspecialchars(addslashes($v['value'])) ?>')" class="p-2 text-blue-400 bg-blue-400/5 hover:bg-blue-400/20 border border-transparent hover:border-blue-400/30 rounded-xl transition-all" title="Edit Variable">
+                                                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg>
+                                                    </button>
+                                                    <form method="POST" action="" class="inline-block m-0" onsubmit="return confirm('Are you sure you want to delete \'<?= htmlspecialchars(addslashes($v['key'])) ?>\' from SSD and Memory?');">
                                                         <input type="hidden" name="action" value="delete">
-                                                        <input type="hidden" name="name" value="<?= htmlspecialchars($v['name']) ?>">
-                                                        <input type="hidden" name="storage" value="<?= $v['storage'] ?>">
-                                                        <button type="submit" class="p-2.5 text-red-400 bg-red-400/5 hover:bg-red-400/20 border border-transparent hover:border-red-400/30 rounded-xl transition-all shadow-[0_4px_10px_rgba(0,0,0,0.1)] hover:shadow-red-500/20" title="Delete Variable">
-                                                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                                                        <input type="hidden" name="var_key" value="<?= htmlspecialchars($v['key']) ?>">
+                                                        <button type="submit" class="p-2 text-red-400 bg-red-400/5 hover:bg-red-400/20 border border-transparent hover:border-red-400/30 rounded-xl transition-all shadow-[0_4px_10px_rgba(0,0,0,0.1)] hover:shadow-red-500/20" title="Delete Variable">
+                                                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
                                                         </button>
                                                     </form>
                                                 </div>
@@ -392,16 +332,14 @@ ksort($variables);
     </div>
 
     <script>
-        function editVar(name, value, storage) {
-            document.getElementById('name').value = name;
-            document.getElementById('value').value = value;
-            document.getElementById('form-action').value = 'edit';
-            document.getElementById('form-title').innerHTML = `Edit <span class="text-white bg-slate-700 px-2 py-0.5 rounded text-sm ml-1">${name}</span>`;
-            document.querySelector(`input[name="storage"][value="${storage}"]`).checked = true;
+        function editVar(key, value) {
+            document.getElementById('var_key').value = key;
+            document.getElementById('var_value').value = value;
+            document.getElementById('form-title').innerHTML = `Edit Variable <span class="text-white bg-slate-700 px-2 py-0.5 rounded text-sm ml-1">${key}</span>`;
             
             // Show cancel button
             document.getElementById('btn-cancel').classList.remove('hidden');
-            document.getElementById('btn-submit').innerHTML = '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg> Update Variable';
+            document.getElementById('btn-submit').innerHTML = '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg> Update SSD & Memory';
             
             window.scrollTo({ top: 0, behavior: 'smooth' });
             
@@ -414,15 +352,29 @@ ksort($variables);
         }
 
         function resetForm() {
-            document.getElementById('name').value = '';
-            document.getElementById('value').value = '';
-            document.getElementById('form-action').value = 'add';
-            document.getElementById('form-title').innerText = 'Add / Edit Variable';
-            document.querySelector(`input[name="storage"][value="mariadb"]`).checked = true;
+            document.getElementById('var_key').value = '';
+            document.getElementById('var_value').value = '';
+            document.getElementById('form-title').innerText = 'Save Variable';
             
             // Hide cancel button
             document.getElementById('btn-cancel').classList.add('hidden');
-            document.getElementById('btn-submit').innerHTML = '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"></path></svg> Save Variable';
+            document.getElementById('btn-submit').innerHTML = '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"></path></svg> Save to SSD & Memory';
+        }
+        
+        function copyApiUrl(url, button) {
+            navigator.clipboard.writeText(url).then(() => {
+                const originalHtml = button.innerHTML;
+                button.innerHTML = '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>';
+                button.classList.add('bg-green-500/20', 'text-green-400');
+                
+                setTimeout(() => {
+                    button.innerHTML = originalHtml;
+                    button.classList.remove('bg-green-500/20', 'text-green-400');
+                }, 2000);
+            }).catch(err => {
+                console.error('Failed to copy text: ', err);
+                alert('Failed to copy to clipboard.');
+            });
         }
     </script>
 </body>

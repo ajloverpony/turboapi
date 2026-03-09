@@ -1,12 +1,12 @@
 <?php
 // ==========================================
-// PORTABLE VARIABLE STORAGE - API
+// DUAL-LAYER VARIABLE STORAGE - API
 // ==========================================
 // Enter your CloudPanel database credentials here:
 $db_host = '127.0.0.1';
-$db_name = 'turboapi';
-$db_user = 'turboapi';
-$db_pass = 'hzO4AX2Z2qXrE2JqcTOA';
+$db_name = 'your_database_name';
+$db_user = 'your_database_user';
+$db_pass = 'your_database_password';
 
 // Redis configuration (Fast Memory Storage)
 $redis_host = '127.0.0.1';
@@ -22,16 +22,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit(0);
 }
 
-// Ensure JSON response
-header('Content-Type: application/json');
-
 // Connect to MariaDB using PDO
 try {
     $pdo = new PDO("mysql:host=$db_host;dbname=$db_name;charset=utf8mb4", $db_user, $db_pass);
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
 } catch (PDOException $e) {
-    echo json_encode(['success' => false, 'error' => 'Database connection failed']);
-    exit;
+    die("fail");
 }
 
 // Connect to Redis (wrapped in try-catch to prevent crashing if not enabled)
@@ -44,75 +40,74 @@ try {
         }
     }
 } catch (Exception $e) {
-    // Redis not available, stay with $redis = null
     $redis = null;
-}
-
-function sendResponse($success, $data = [], $message = '') {
-    echo json_encode([
-        'success' => $success,
-        'data' => $data,
-        'message' => $message
-    ]);
-    exit;
 }
 
 $action = $_GET['action'] ?? '';
 $name = $_REQUEST['name'] ?? '';
 
 if (!$action || !$name) {
-    sendResponse(false, [], 'Missing action or name parameter. Use ?action=get&name=myvar or action=set');
+    die("fail");
 }
 
-if ($action === 'get') {
-    // 1. Try Redis first (fast)
+if ($action === 'pull') {
+    // Ensure plain text response
+    header('Content-Type: text/plain');
+    
+    // 1. Try Redis first (fast Memory)
     if ($redis) {
         $val = $redis->get($redis_prefix . $name);
         if ($val !== false) {
-            sendResponse(true, ['name' => $name, 'value' => $val, 'source' => 'redis']);
+            echo $val;
+            exit;
         }
     }
     
-    // 2. Fallback to MariaDB (persistent)
-    $stmt = $pdo->prepare("SELECT value FROM variables WHERE name = ?");
+    // 2. Fallback to MariaDB (SSD)
+    $stmt = $pdo->prepare("SELECT var_value FROM variables WHERE var_key = ?");
     $stmt->execute([$name]);
     $row = $stmt->fetch(PDO::FETCH_ASSOC);
     
     if ($row) {
-        sendResponse(true, ['name' => $name, 'value' => $row['value'], 'source' => 'mariadb']);
-    } else {
-        // Variable not found, sending empty value rather than failing allows client to act on defaults
-        sendResponse(true, ['name' => $name, 'value' => null, 'source' => 'none'], 'Variable not found');
-    }
-} 
-elseif ($action === 'set') {
-    // Read value from request (either standard POST var or raw body)
-    $value = isset($_REQUEST['value']) ? $_REQUEST['value'] : file_get_contents('php://input');
-    
-    // Determine target storage. Client can define it via &storage=redis/mariadb. Default to MariaDB.
-    $storage = strtolower($_REQUEST['storage'] ?? 'mariadb');
-    
-    if ($storage === 'redis') {
+        $value = $row['var_value'];
+        
+        // Update Redis for next time
         if ($redis) {
             $redis->set($redis_prefix . $name, $value);
-            // Optionally remove from MariaDB so there are no overlapping shadows
-            $stmt = $pdo->prepare("DELETE FROM variables WHERE name = ?");
-            $stmt->execute([$name]);
-            sendResponse(true, ['name' => $name, 'storage' => 'redis']);
-        } else {
-            sendResponse(false, [], 'Redis is not connected on this server, could not save.');
         }
+        
+        echo $value;
+        exit;
     } else {
-        // Fallback or explicit 'mariadb'
-        $stmt = $pdo->prepare("INSERT INTO variables (name, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = ?");
+        // Variable not found, sending empty text
+        echo "";
+        exit;
+    }
+} 
+elseif ($action === 'save') {
+    // Ensure plain text response
+    header('Content-Type: text/plain');
+    
+    // Read value from request (either standard POST value or raw body)
+    $value = isset($_REQUEST['value']) ? $_REQUEST['value'] : file_get_contents('php://input');
+    
+    try {
+        // Dual-write: MariaDB first
+        $stmt = $pdo->prepare("INSERT INTO variables (var_key, var_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE var_value = ?");
         $stmt->execute([$name, $value, $value]);
         
-        // Remove from redis if exists to prevent stale cached data
+        // Dual-write: Redis second
         if ($redis) {
-            $redis->del($redis_prefix . $name);
+            $redis->set($redis_prefix . $name, $value);
         }
-        sendResponse(true, ['name' => $name, 'storage' => 'mariadb']);
+        
+        echo "success";
+        exit;
+    } catch (Exception $e) {
+        echo "fail";
+        exit;
     }
 } else {
-    sendResponse(false, [], 'Unknown action. Supported actions: get, set.');
+    echo "fail";
+    exit;
 }
