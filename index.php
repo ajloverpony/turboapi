@@ -287,31 +287,37 @@ if ($isAjax) {
         const redisPulse = document.getElementById('redis-pulse');
 
         eventSource.onopen = () => {
+            console.log("SSE Connection Established");
             badge.classList.remove('hidden');
             if (redisPulse) redisPulse.classList.add('animate-pulse');
         };
 
-        eventSource.onmessage = (event) => {
+        // Listen for the specific 'update' event
+        eventSource.addEventListener('update', (event) => {
             const data = JSON.parse(event.data);
             if (data.update) {
+                console.log("Change detected at " + data.timestamp);
                 refreshTable();
             }
-        };
+        });
 
-        eventSource.onerror = () => {
+        eventSource.onerror = (err) => {
+            console.warn("SSE Connection lost. Reconnecting...");
             badge.classList.add('hidden');
             if (redisPulse) redisPulse.classList.remove('animate-pulse');
         };
 
         function refreshTable() {
-            fetch('index.php?ajax=1')
+            // Added cache-buster and no-store to ensure we never get stale data
+            fetch('index.php?ajax=1&nocache=' + Date.now(), { cache: 'no-store' })
                 .then(res => res.text())
                 .then(html => {
                     const tbody = document.getElementById('variables-table-body');
                     tbody.innerHTML = html;
                     tbody.classList.add('update-flash');
                     setTimeout(() => tbody.classList.remove('update-flash'), 1000);
-                });
+                })
+                .catch(err => console.error("Refresh failed:", err));
         }
 
         function editVar(key, val) {
