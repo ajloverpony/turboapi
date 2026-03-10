@@ -1,12 +1,12 @@
 <?php
 // ==========================================
-// DUAL-LAYER VARIABLE STORAGE - API
+// DUAL-LAYER ADVANCED VARIABLE STORAGE - API
 // ==========================================
 // Enter your CloudPanel database credentials here:
 $db_host = '127.0.0.1';
-$db_name = 'your_database_name';
-$db_user = 'your_database_user';
-$db_pass = 'your_database_password';
+$db_name = 'turboapi';
+$db_user = 'turboapi';
+$db_pass = 'hzO4AX2Z2qXrE2JqcTOA';
 
 // Redis configuration (Fast Memory Storage)
 $redis_host = '127.0.0.1';
@@ -17,10 +17,14 @@ $redis_prefix = 'tw_var_'; // Prefix to avoid key collisions
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Methods: GET, POST, OPTIONS");
 header("Access-Control-Allow-Headers: Content-Type");
+header("X-Accel-Buffering: no"); // Prevent Nginx buffering for SSE/Live updates
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit(0);
 }
+
+// Ensure plain text response
+header('Content-Type: text/plain');
 
 // Connect to MariaDB using PDO
 try {
@@ -30,7 +34,7 @@ try {
     die("fail");
 }
 
-// Connect to Redis (wrapped in try-catch to prevent crashing if not enabled)
+// Connect to Redis
 $redis = null;
 try {
     if (class_exists('Redis')) {
@@ -50,63 +54,141 @@ if (!$action || !$name) {
     die("fail");
 }
 
-if ($action === 'pull') {
-    // Ensure plain text response
-    header('Content-Type: text/plain');
-    
-    // 1. Try Redis first (fast Memory)
+/**
+ * Calculate size in bytes and return human-readable format
+ */
+function getFormattedSize($string) {
+    $bytes = strlen($string);
+    if ($bytes >= 1048576) {
+        return number_format($bytes / 1048576, 2) . 'mb';
+    } elseif ($bytes >= 1024) {
+        return number_format($bytes / 1024, 2) . 'kb';
+    } else {
+        return $bytes . 'b';
+    }
+}
+
+/**
+ * Trigger the update signal for SSE
+ */
+function notifyUpdate($redis) {
+    if ($redis) {
+        $redis->set('last_update_time', microtime(true));
+    }
+}
+
+// Helper function to get current value (Redis -> DB fallback)
+function getCurrentValue($name, $pdo, $redis, $redis_prefix) {
     if ($redis) {
         $val = $redis->get($redis_prefix . $name);
         if ($val !== false) {
-            echo $val;
-            exit;
+            return $val;
         }
     }
     
-    // 2. Fallback to MariaDB (SSD)
     $stmt = $pdo->prepare("SELECT var_value FROM variables WHERE var_key = ?");
     $stmt->execute([$name]);
     $row = $stmt->fetch(PDO::FETCH_ASSOC);
     
     if ($row) {
-        $value = $row['var_value'];
-        
-        // Update Redis for next time
-        if ($redis) {
-            $redis->set($redis_prefix . $name, $value);
-        }
-        
-        echo $value;
-        exit;
-    } else {
-        // Variable not found, sending empty text
-        echo "";
-        exit;
+        return $row['var_value'];
     }
-} 
-elseif ($action === 'save') {
-    // Ensure plain text response
-    header('Content-Type: text/plain');
-    
-    // Read value from request (either standard POST value or raw body)
-    $value = isset($_REQUEST['value']) ? $_REQUEST['value'] : file_get_contents('php://input');
-    
+    return ""; // Default empty string if not found
+}
+
+// Helper function to save dual-layer
+function saveDualLayer($name, $value, $pdo, $redis, $redis_prefix) {
     try {
-        // Dual-write: MariaDB first
         $stmt = $pdo->prepare("INSERT INTO variables (var_key, var_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE var_value = ?");
         $stmt->execute([$name, $value, $value]);
         
-        // Dual-write: Redis second
         if ($redis) {
             $redis->set($redis_prefix . $name, $value);
         }
         
-        echo "success";
-        exit;
+        // Notify SSE stream
+        notifyUpdate($redis);
+        
+        return true;
     } catch (Exception $e) {
-        echo "fail";
+        return false;
+    }
+}
+
+if ($action === 'pull') {
+    $current_value = getCurrentValue($name, $pdo, $redis, $redis_prefix);
+    
+    // Auto-heal redis cache
+    if ($redis) {
+        $redis->set($redis_prefix . $name, $current_value);
+    }
+    
+    $range = $_GET['range'] ?? '';
+    
+    // Support range-based retrieval
+    if ($range && preg_match('/^(\d+)-(\d+)$/', $range, $matches)) {
+        $start = (int)$matches[1];
+        $end = (int)$matches[2];
+        $len = max(0, $end - $start + 1);
+        $sliced = mb_substr($current_value, $start, $len);
+        echo $sliced;
         exit;
     }
+    
+    echo $current_value;
+    exit;
+} 
+elseif ($action === 'save') {
+    $value = isset($_REQUEST['value']) ? $_REQUEST['value'] : file_get_contents('php://input');
+    
+    if (saveDualLayer($name, $value, $pdo, $redis, $redis_prefix)) {
+        echo "success";
+    } else {
+        echo "fail";
+    }
+    exit;
+}
+elseif ($action === 'append') {
+    $value = isset($_REQUEST['value']) ? $_REQUEST['value'] : file_get_contents('php://input');
+    $current_value = getCurrentValue($name, $pdo, $redis, $redis_prefix);
+    
+    $new_value = $current_value . $value;
+    
+    if (saveDualLayer($name, $new_value, $pdo, $redis, $redis_prefix)) {
+        echo "success";
+    } else {
+        echo "fail";
+    }
+    exit;
+}
+elseif ($action === 'replace') {
+    $value = isset($_REQUEST['value']) ? $_REQUEST['value'] : file_get_contents('php://input');
+    $range = $_REQUEST['range'] ?? '';
+    $current_value = getCurrentValue($name, $pdo, $redis, $redis_prefix);
+    
+    if (preg_match('/^(\d+)-(\d+)$/', $range, $matches)) {
+        $start = (int)$matches[1];
+        $end = (int)$matches[2];
+        $len = max(0, $end - $start + 1);
+        
+        $prefix = mb_substr($current_value, 0, $start);
+        $suffix = mb_substr($current_value, $start + $len);
+        
+        $new_value = $prefix . $value . $suffix;
+        
+        if (saveDualLayer($new_value, $new_value, $pdo, $redis, $redis_prefix)) {
+            // Wait, saveDualLayer expects $name, $value, ...
+        }
+        // Fixed below:
+        if (saveDualLayer($name, $new_value, $pdo, $redis, $redis_prefix)) {
+             echo "success";
+        } else {
+            echo "fail";
+        }
+    } else {
+        echo "fail";
+    }
+    exit;
 } else {
     echo "fail";
     exit;

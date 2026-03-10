@@ -1,134 +1,153 @@
 <?php
 // ==========================================
-// PORTABLE VARIABLE STORAGE - Web GUI
+// PORTABLE VARIABLE STORAGE - Web GUI (Upgrade)
 // ==========================================
 // Enter your CloudPanel database credentials here:
 $db_host = '127.0.0.1';
-$db_name = 'your_database_name';
-$db_user = 'your_database_user';
-$db_pass = 'your_database_password';
+$db_name = 'turboapi';
+$db_user = 'turboapi';
+$db_pass = 'hzO4AX2Z2qXrE2JqcTOA';
 
-// Redis configuration (Fast Memory Storage)
+// Redis configuration
 $redis_host = '127.0.0.1';
 $redis_port = 6379;
-$redis_prefix = 'tw_var_'; // Prefix to avoid key collisions
+$redis_prefix = 'tw_var_';
 
-// Determine base API URL for the Copy Link feature
+// Determine base API URL
 $protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off' || $_SERVER['SERVER_PORT'] == 443) ? "https://" : "http://";
 $domainName = $_SERVER['HTTP_HOST'];
 $api_url_base = rtrim($protocol . $domainName . '/' . ltrim(dirname($_SERVER['SCRIPT_NAME']), '/'), '/') . '/api.php';
 
-// Connect to MariaDB using PDO
-$mariadb_status = 'Disconnected';
+/**
+ * Calculate size in bytes and return human-readable format
+ */
+function getFormattedSize($string) {
+    $bytes = strlen($string);
+    if ($bytes >= 1048576) {
+        return number_format($bytes / 1048576, 2) . 'mb';
+    } elseif ($bytes >= 1024) {
+        return number_format($bytes / 1024, 2) . 'kb';
+    } else {
+        return $bytes . 'b';
+    }
+}
+
+/**
+ * Trigger update for SSE
+ */
+function triggerUpdate($pdo, $redis) {
+    if ($redis) {
+        $redis->set('last_update_time', microtime(true));
+    }
+}
+
+// Connect to MariaDB
 $pdo = null;
 try {
     $pdo = new PDO("mysql:host=$db_host;dbname=$db_name;charset=utf8mb4", $db_user, $db_pass);
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
     $mariadb_status = 'Connected';
 } catch (PDOException $e) {
-    if ($db_name == 'your_database_name') {
-        $mariadb_status = 'Pending Setup (Check connection details)';
-    } else {
-        $mariadb_status = 'Error: ' . $e->getMessage();
-    }
+    $mariadb_status = 'Error';
 }
 
 // Connect to Redis
 $redis = null;
-$redis_status = 'Unavailable';
 try {
     if (class_exists('Redis')) {
         $redis = new Redis();
         if ($redis->connect($redis_host, $redis_port)) {
             $redis_status = 'Connected';
         } else {
-            $redis_status = 'Connection Failed';
+            $redis_status = 'Error';
             $redis = null;
         }
     } else {
-        $redis_status = 'Redis extension not loaded';
+        $redis_status = 'Missing Extension';
     }
 } catch (Exception $e) {
-    $redis_status = 'Error: ' . $e->getMessage();
-    $redis = null;
+    $redis_status = 'Error';
 }
 
-$message = '';
-$messageType = ''; // 'success' or 'error'
+// Handle AJAX refresh request
+if (isset($_GET['refresh'])) {
+    renderTable($pdo, $redis, $redis_prefix, $api_url_base);
+    exit;
+}
 
 // Handle form submissions
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = $_POST['action'] ?? '';
     $key = $_POST['var_key'] ?? '';
-    
-    if ($action === 'save') {
-        $value = $_POST['var_value'] ?? '';
-        
-        if (trim($key) === '') {
-            $message = 'Variable key cannot be empty.';
-            $messageType = 'error';
-        } else {
-            try {
-                if ($pdo) {
-                    $stmt = $pdo->prepare("INSERT INTO variables (var_key, var_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE var_value = ?");
-                    $stmt->execute([$key, $value, $value]);
-                    
-                    if ($redis) {
-                        $redis->set($redis_prefix . $key, $value);
-                        $message = "Variable '$key' saved to SSD and Memory successfully.";
-                    } else {
-                        $message = "Variable '$key' saved to SSD only (Redis offline).";
-                    }
-                    $messageType = 'success';
-                } else {
-                    $message = 'Cannot save to DB: MariaDB is not connected.';
-                    $messageType = 'error';
-                }
-            } catch (Exception $e) {
-                $message = 'Error saving variable: ' . $e->getMessage();
-                $messageType = 'error';
-            }
-        }
+    $value = $_POST['var_value'] ?? '';
+
+    if ($action === 'save' && trim($key) !== '') {
+        $stmt = $pdo->prepare("INSERT INTO variables (var_key, var_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE var_value = ?");
+        $stmt->execute([$key, $value, $value]);
+        if ($redis) $redis->set($redis_prefix . $key, $value);
+        triggerUpdate($pdo, $redis);
     } elseif ($action === 'delete') {
-        try {
-            if ($pdo) {
-                $stmt = $pdo->prepare("DELETE FROM variables WHERE var_key = ?");
-                $stmt->execute([$key]);
-            }
-            if ($redis) {
-                $redis->del($redis_prefix . $key);
-            }
-            $message = "Variable '$key' deleted from SSD & Memory.";
-            $messageType = 'success';
-        } catch (Exception $e) {
-            $message = 'Error deleting variable: ' . $e->getMessage();
-            $messageType = 'error';
-        }
+        $stmt = $pdo->prepare("DELETE FROM variables WHERE var_key = ?");
+        $stmt->execute([$key]);
+        if ($redis) $redis->del($redis_prefix . $key);
+        triggerUpdate($pdo, $redis);
     }
 }
 
-// Fetch all variables to display from MariaDB (Source of Truth)
-$variables = [];
-if ($pdo && $mariadb_status === 'Connected') {
-    try {
-        $stmt = $pdo->query("SELECT var_key, var_value, updated_at FROM variables ORDER BY var_key ASC");
-        while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
-            // Check if it exists in Memory too
-            $in_redis = false;
-            if ($redis && $redis->exists($redis_prefix . $row['var_key'])) {
-                $in_redis = true;
-            }
-            
-            $variables[] = [
-                'key' => $row['var_key'],
-                'value' => $row['var_value'],
-                'updated_at' => $row['updated_at'],
-                'in_redis' => $in_redis
-            ];
-        }
-    } catch (PDOException $e) {
-        $message = "Table 'variables' not found. Please paste db_setup.sql into phpMyAdmin first.";
-        $messageType = "error";
+/**
+ * Render the variables table content
+ */
+function renderTable($pdo, $redis, $redis_prefix, $api_url_base) {
+    if (!$pdo) return;
+    $stmt = $pdo->query("SELECT var_key, var_value, updated_at FROM variables ORDER BY var_key ASC");
+    $variables = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    if (empty($variables)) {
+        echo '<tr><td colspan="4" class="px-6 py-12 text-center text-slate-500 italic">No variables found.</td></tr>';
+        return;
+    }
+
+    foreach ($variables as $v) {
+        $in_redis = $redis && $redis->exists($redis_prefix . $v['var_key']);
+        $size = getFormattedSize($v['var_value']);
+        $pull_url = $api_url_base . "?action=pull&name=" . urlencode($v['key'] ?? $v['var_key']);
+        ?>
+        <tr class="hover:bg-slate-800/40 transition-colors border-b border-slate-700/50">
+            <td class="px-6 py-4 font-mono text-sm text-blue-400 font-bold"><?= htmlspecialchars($v['var_key']) ?></td>
+            <td class="px-6 py-4">
+                <div class="flex items-center gap-2">
+                    <span class="max-w-[200px] truncate block opacity-70"><?= htmlspecialchars($v['var_value']) ?></span>
+                    <span class="text-[10px] bg-indigo-500/20 text-indigo-300 px-1.5 py-0.5 rounded font-bold uppercase"><?= $size ?></span>
+                </div>
+            </td>
+            <td class="px-6 py-4">
+                <div class="flex flex-col gap-1">
+                    <span class="text-[10px] text-slate-500 uppercase">Upd: <?= date('H:i:s', strtotime($v['updated_at'])) ?></span>
+                    <div class="flex gap-1">
+                        <span class="w-2 h-2 rounded-full bg-blue-500" title="SSD"></span>
+                        <?php if ($in_redis): ?><span class="w-2 h-2 rounded-full bg-emerald-500" title="Memory"></span><?php endif; ?>
+                    </div>
+                </div>
+            </td>
+            <td class="px-6 py-4 text-right">
+                <div class="flex justify-end gap-2">
+                    <button onclick="copyToClipboard('<?= $pull_url ?>', this)" class="p-2 bg-slate-700 hover:bg-emerald-600 rounded text-slate-300 transition-all" title="Copy Pull URL">
+                       <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3"></path></svg>
+                    </button>
+                    <button onclick="editVar('<?= addslashes($v['var_key']) ?>', '<?= addslashes($v['var_value']) ?>')" class="p-2 bg-slate-700 hover:bg-blue-600 rounded text-slate-300 transition-all">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg>
+                    </button>
+                    <form method="POST" style="display:inline">
+                        <input type="hidden" name="action" value="delete">
+                        <input type="hidden" name="var_key" value="<?= htmlspecialchars($v['var_key']) ?>">
+                        <button type="submit" class="p-2 bg-slate-700 hover:bg-red-600 rounded text-slate-300 transition-all">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                        </button>
+                    </form>
+                </div>
+            </td>
+        </tr>
+        <?php
     }
 }
 ?>
@@ -137,192 +156,86 @@ if ($pdo && $mariadb_status === 'Connected') {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dual-Layer Variable Storage</title>
-    <!-- Use Tailwind CSS for a highly premium, dark modern feel -->
+    <title>Live Variable Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono&display=swap" rel="stylesheet">
     <style>
-        body { 
-            background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
-            color: #f8fafc;
-            min-height: 100vh;
-        }
-        .glass-panel {
-            background: rgba(30, 41, 59, 0.7);
-            backdrop-filter: blur(12px);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
-            transition: box-shadow 0.3s ease;
-        }
-        /* Fix input backgrounds */
-        input[type="text"], textarea {
-            background: rgba(15, 23, 42, 0.6);
-            color: white;
-            border: 1px solid rgba(148, 163, 184, 0.3);
-            transition: all 0.2s ease;
-        }
-        input[type="text"]:focus, textarea:focus {
-            border-color: #3b82f6;
-            outline: none;
-            box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.5);
-        }
-        /* Custom scrollbar */
-        ::-webkit-scrollbar {
-            width: 8px;
-            height: 8px;
-        }
-        ::-webkit-scrollbar-track {
-            background: rgba(15, 23, 42, 0.5); 
-        }
-        ::-webkit-scrollbar-thumb {
-            background: rgba(148, 163, 184, 0.3); 
-            border-radius: 4px;
-        }
-        ::-webkit-scrollbar-thumb:hover {
-            background: rgba(148, 163, 184, 0.6); 
-        }
+        body { font-family: 'Inter', sans-serif; background: #0b0f1a; color: #e2e8f0; }
+        .glass { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.05); }
+        .mono { font-family: 'JetBrains Mono', monospace; }
+        .btn-glow { transition: all 0.3s; }
+        .btn-glow:hover { box-shadow: 0 0 15px rgba(59, 130, 246, 0.5); transform: translateY(-1px); }
     </style>
 </head>
-<body class="p-4 md:p-8 font-sans antialiased">
+<body class="p-4 md:p-10">
     <div class="max-w-6xl mx-auto">
-        <header class="flex flex-col md:flex-row justify-between items-center mb-10 pb-6 border-b border-slate-700">
+        <!-- Header -->
+        <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-6 mb-12">
             <div>
-                <h1 class="text-3xl font-extrabold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-indigo-500 mb-2">Dual-Layer Variable Storage</h1>
-                <p class="text-slate-400 font-medium tracking-wide">TurboWarp SSD/Memory Sync Service</p>
+                <h1 class="text-4xl font-extrabold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-emerald-400 mb-2">Dual-Layer Storage</h1>
+                <p class="text-slate-400 font-medium">Real-time variables with SSD/Memory persistence.</p>
             </div>
             
-            <div class="flex flex-col gap-2 mt-4 md:mt-0 text-sm">
-                <div class="flex items-center gap-3 px-4 py-2 rounded-full bg-slate-800/80 border <?= $mariadb_status === 'Connected' ? 'border-green-500/50' : 'border-red-500/50' ?> shadow-lg">
-                    <div class="w-3 h-3 rounded-full <?= $mariadb_status === 'Connected' ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.8)]' : 'bg-red-500 animate-pulse shadow-[0_0_8px_rgba(239,68,68,0.8)]' ?>"></div>
-                    <span class="text-slate-300 font-medium tracking-wider text-xs uppercase">SSD (MariaDB): <span class="<?= $mariadb_status === 'Connected' ? 'text-green-400' : 'text-red-400' ?>"><?= htmlspecialchars($mariadb_status) ?></span></span>
+            <div class="flex gap-4">
+                <div class="glass px-4 py-2 rounded-xl flex items-center gap-3">
+                    <div id="sse-status" class="w-2.5 h-2.5 rounded-full bg-slate-600 animate-pulse"></div>
+                    <span class="text-xs font-bold tracking-widest uppercase opacity-60">Live Stream</span>
                 </div>
-                <div class="flex items-center gap-3 px-4 py-2 rounded-full bg-slate-800/80 border <?= $redis_status === 'Connected' ? 'border-green-500/50' : 'border-yellow-500/50' ?> shadow-lg">
-                    <div class="w-3 h-3 rounded-full <?= $redis_status === 'Connected' ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.8)]' : 'bg-yellow-500 animate-pulse shadow-[0_0_8px_rgba(234,179,8,0.8)]' ?>"></div>
-                    <span class="text-slate-300 font-medium tracking-wider text-xs uppercase">Memory (Redis): <span class="<?= $redis_status === 'Connected' ? 'text-green-400' : 'text-yellow-400' ?>"><?= htmlspecialchars($redis_status) ?></span></span>
+                <div class="glass px-4 py-2 rounded-xl flex items-center gap-2">
+                    <span class="text-[10px] uppercase font-bold text-slate-500">Node:</span>
+                    <span class="text-xs font-mono text-emerald-400">CloudPanel-PRO</span>
                 </div>
             </div>
-        </header>
+        </div>
 
-        <?php if ($message): ?>
-            <div class="mb-8 p-4 rounded-xl <?= $messageType === 'success' ? 'bg-green-900/30 border border-green-500/50 text-green-300' : 'bg-red-900/30 border border-red-500/50 text-red-300' ?> shadow-lg flex items-center gap-3 animate-fade-in">
-                <?php if ($messageType === 'success'): ?>
-                    <svg class="w-6 h-6 text-green-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-                <?php else: ?>
-                    <svg class="w-6 h-6 text-red-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-                <?php endif; ?>
-                <span class="font-medium"><?= htmlspecialchars($message) ?></span>
-            </div>
-        <?php endif; ?>
-
-        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
-            <!-- Add/Edit Form -->
-            <div class="lg:col-span-1">
-                <div id="form-panel" class="glass-panel p-6 rounded-2xl w-full sticky top-8">
-                    <h2 class="text-xl font-bold mb-6 flex items-center gap-2">
-                        <svg class="w-5 h-5 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
-                        <span id="form-title">Save Variable</span>
+        <div class="grid grid-cols-1 lg:grid-cols-4 gap-8">
+            <!-- Sidebar: Editor -->
+            <div class="lg:col-span-1 space-y-6">
+                <div class="glass p-6 rounded-2xl">
+                    <h2 class="text-lg font-bold mb-6 flex items-center gap-2">
+                        <svg class="w-5 h-5 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v3m0 0v3m0-3h3m-3 0H9m12 0a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                        Quick Edit
                     </h2>
-                    
-                    <form method="POST" action="">
-                        <input type="hidden" name="action" id="form-action" value="save">
-                        
-                        <div class="mb-5">
-                            <label class="block text-sm font-semibold text-slate-300 mb-2 uppercase tracking-wide" for="var_key">Variable Key</label>
-                            <input type="text" id="var_key" name="var_key" required placeholder="e.g. global_score" class="w-full px-4 py-3 rounded-xl placeholder-slate-500 font-mono text-sm" />
+                    <form method="POST" id="editForm" class="space-y-4">
+                        <input type="hidden" name="action" value="save">
+                        <div>
+                            <label class="block text-[10px] font-bold uppercase text-slate-500 mb-1 ml-1">Key Name</label>
+                            <input type="text" name="var_key" id="var_key" required class="w-full bg-slate-900/50 border border-slate-700 rounded-lg px-3 py-2 text-sm mono focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="player_score">
                         </div>
-                        
-                        <div class="mb-6">
-                            <label class="block text-sm font-semibold text-slate-300 mb-2 uppercase tracking-wide" for="var_value">Value <span class="text-slate-500 text-xs normal-case font-normal">(String / JSON)</span></label>
-                            <textarea id="var_value" name="var_value" rows="5" class="w-full px-4 py-3 rounded-xl placeholder-slate-500 font-mono text-sm" placeholder="Enter data..."></textarea>
+                        <div>
+                            <label class="block text-[10px] font-bold uppercase text-slate-500 mb-1 ml-1">Value</label>
+                            <textarea name="var_value" id="var_value" rows="4" class="w-full bg-slate-900/50 border border-slate-700 rounded-lg px-3 py-2 text-sm mono focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="1000"></textarea>
                         </div>
-                        
-                        <div class="flex gap-3">
-                            <button type="button" id="btn-cancel" onclick="resetForm()" class="hidden flex-1 py-3 px-4 bg-slate-800 hover:bg-slate-700 border border-slate-600 text-white rounded-xl font-bold transition-all transform active:scale-95">
-                                Cancel
-                            </button>
-                            <button type="submit" id="btn-submit" class="flex-[2] w-full py-3 px-4 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white rounded-xl font-bold shadow-lg shadow-blue-500/25 transition-all transform active:scale-95 flex justify-center items-center gap-2">
-                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"></path></svg>
-                                Save to SSD & Memory
-                            </button>
-                        </div>
+                        <button type="submit" class="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-3 rounded-xl btn-glow flex justify-center items-center gap-2">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"></path></svg>
+                            Commit Sync
+                        </button>
                     </form>
                 </div>
             </div>
-            
-            <!-- List of Variables -->
-            <div class="lg:col-span-2">
-                <div class="glass-panel text-white rounded-2xl overflow-hidden shadow-2xl">
-                    <div class="p-6 border-b border-slate-700/80 flex justify-between items-center bg-slate-800/40">
-                        <h2 class="text-xl font-bold flex items-center gap-2">
-                            <svg class="w-5 h-5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"></path></svg>
-                            Stored Variables
-                        </h2>
-                        <span class="bg-indigo-500/20 border border-indigo-500/30 px-3 py-1 rounded-full text-xs font-bold text-indigo-300 tracking-wider">
-                            <?= count($variables) ?> ITEM<?= count($variables) !== 1 ? 'S' : '' ?>
-                        </span>
+
+            <!-- Main: Variables Table -->
+            <div class="lg:col-span-3">
+                <div class="glass rounded-3xl overflow-hidden shadow-2xl">
+                    <div class="px-8 py-6 bg-slate-800/20 flex justify-between items-center border-b border-slate-700/50">
+                        <h3 class="font-bold flex items-center gap-3">
+                            <span class="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_10px_#10b981]"></span>
+                            Live Registry
+                        </h3>
+                        <a href="docs.php" class="text-xs font-bold text-blue-400 hover:underline">View API Syntax</a>
                     </div>
-                    
                     <div class="overflow-x-auto">
-                        <table class="w-full text-left border-collapse">
-                            <thead class="bg-slate-900/60 text-slate-400 text-xs uppercase tracking-wider">
-                                <tr>
-                                    <th class="px-6 py-4 font-bold border-b border-slate-700/50">Key</th>
-                                    <th class="px-6 py-4 font-bold border-b border-slate-700/50 w-2/5">Value</th>
-                                    <th class="px-6 py-4 font-bold border-b border-slate-700/50 text-center">Status</th>
-                                    <th class="px-6 py-4 font-bold border-b border-slate-700/50 text-right">Actions</th>
+                        <table class="w-full">
+                            <thead>
+                                <tr class="text-left text-[10px] uppercase font-bold text-slate-500 bg-slate-900/30">
+                                    <th class="px-6 py-4">Variable Key</th>
+                                    <th class="px-6 py-4">Live Content / Metrics</th>
+                                    <th class="px-6 py-4">Storage</th>
+                                    <th class="px-6 py-4 text-right">Utility</th>
                                 </tr>
                             </thead>
-                            <tbody class="divide-y divide-slate-700/40">
-                                <?php if (empty($variables)): ?>
-                                    <tr>
-                                        <td colspan="4" class="px-6 py-16 text-center text-slate-500 flex flex-col items-center justify-center gap-4">
-                                            <svg class="w-16 h-16 opacity-30" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4"></path></svg>
-                                            <p class="text-lg">No variables stored yet.</p>
-                                        </td>
-                                    </tr>
-                                <?php else: ?>
-                                    <?php foreach ($variables as $v): ?>
-                                        <tr class="hover:bg-slate-800/50 transition-colors group">
-                                            <td class="px-6 py-4">
-                                                <div class="font-mono text-sm text-blue-300 font-semibold mb-1"><?= htmlspecialchars($v['key']) ?></div>
-                                                <div class="text-[10px] text-slate-500 font-medium uppercase tracking-wider">Upd: <?= $v['updated_at'] ?></div>
-                                            </td>
-                                            <td class="px-6 py-4">
-                                                <div class="max-w-[200px] md:max-w-[250px] bg-slate-900/50 p-2.5 rounded-lg border border-slate-700/50 font-mono text-sm text-slate-300 overflow-hidden text-ellipsis whitespace-nowrap group-hover:bg-slate-900/80 transition-colors" title="<?= htmlspecialchars($v['value']) ?>">
-                                                    <?= htmlspecialchars($v['value']) ?>
-                                                </div>
-                                            </td>
-                                            <td class="px-6 py-4 text-center">
-                                                <div class="flex flex-col gap-1 items-center">
-                                                    <span class="inline-flex items-center gap-1.5 px-2 py-1 rounded-md bg-blue-500/10 text-blue-400 border border-blue-500/20 text-[10px] font-bold uppercase tracking-wider w-16 justify-center" title="Saved permanently to MariaDB">
-                                                        SSD
-                                                    </span>
-                                                    <?php if ($v['in_redis']): ?>
-                                                        <span class="inline-flex items-center gap-1.5 px-2 py-1 rounded-md bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 text-[10px] font-bold uppercase tracking-wider w-16 justify-center" title="Cached in fast Redis memory">
-                                                            Memory
-                                                        </span>
-                                                    <?php endif; ?>
-                                                </div>
-                                            </td>
-                                            <td class="px-6 py-4 text-right">
-                                                <div class="flex items-center justify-end gap-2 opacity-60 group-hover:opacity-100 transition-opacity">
-                                                    <button type="button" onclick="copyApiUrl('<?= htmlspecialchars(addslashes($api_url_base . '?action=pull&name=' . urlencode($v['key']))) ?>', this)" class="p-2 text-emerald-400 bg-emerald-400/5 hover:bg-emerald-400/20 border border-transparent hover:border-emerald-400/30 rounded-xl transition-all" title="Copy Pull Link">
-                                                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path></svg>
-                                                    </button>
-                                                    <button type="button" onclick="editVar('<?= htmlspecialchars(addslashes($v['key'])) ?>', '<?= htmlspecialchars(addslashes($v['value'])) ?>')" class="p-2 text-blue-400 bg-blue-400/5 hover:bg-blue-400/20 border border-transparent hover:border-blue-400/30 rounded-xl transition-all" title="Edit Variable">
-                                                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg>
-                                                    </button>
-                                                    <form method="POST" action="" class="inline-block m-0" onsubmit="return confirm('Are you sure you want to delete \'<?= htmlspecialchars(addslashes($v['key'])) ?>\' from SSD and Memory?');">
-                                                        <input type="hidden" name="action" value="delete">
-                                                        <input type="hidden" name="var_key" value="<?= htmlspecialchars($v['key']) ?>">
-                                                        <button type="submit" class="p-2 text-red-400 bg-red-400/5 hover:bg-red-400/20 border border-transparent hover:border-red-400/30 rounded-xl transition-all shadow-[0_4px_10px_rgba(0,0,0,0.1)] hover:shadow-red-500/20" title="Delete Variable">
-                                                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
-                                                        </button>
-                                                    </form>
-                                                </div>
-                                            </td>
-                                        </tr>
-                                    <?php endforeach; ?>
-                                <?php endif; ?>
+                            <tbody id="variables-table">
+                                <?= renderTable($pdo, $redis, $redis_prefix, $api_url_base) ?>
                             </tbody>
                         </table>
                     </div>
@@ -332,50 +245,48 @@ if ($pdo && $mariadb_status === 'Connected') {
     </div>
 
     <script>
-        function editVar(key, value) {
-            document.getElementById('var_key').value = key;
-            document.getElementById('var_value').value = value;
-            document.getElementById('form-title').innerHTML = `Edit Variable <span class="text-white bg-slate-700 px-2 py-0.5 rounded text-sm ml-1">${key}</span>`;
-            
-            // Show cancel button
-            document.getElementById('btn-cancel').classList.remove('hidden');
-            document.getElementById('btn-submit').innerHTML = '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg> Update SSD & Memory';
-            
-            window.scrollTo({ top: 0, behavior: 'smooth' });
-            
-            // Highlight form
-            const formContainer = document.getElementById('form-panel');
-            formContainer.style.boxShadow = '0 0 0 3px rgba(59, 130, 246, 0.6), 0 25px 50px -12px rgba(0, 0, 0, 0.5)';
-            setTimeout(() => {
-                formContainer.style.boxShadow = '0 25px 50px -12px rgba(0, 0, 0, 0.5)';
-            }, 1500);
+        // Copy to clipboard helper
+        function copyToClipboard(text, btn) {
+            navigator.clipboard.writeText(text);
+            const original = btn.innerHTML;
+            btn.innerHTML = '<svg class="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>';
+            setTimeout(() => btn.innerHTML = original, 2000);
         }
 
-        function resetForm() {
-            document.getElementById('var_key').value = '';
-            document.getElementById('var_value').value = '';
-            document.getElementById('form-title').innerText = 'Save Variable';
-            
-            // Hide cancel button
-            document.getElementById('btn-cancel').classList.add('hidden');
-            document.getElementById('btn-submit').innerHTML = '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"></path></svg> Save to SSD & Memory';
+        // Edit helper
+        function editVar(key, val) {
+            document.getElementById('var_key').value = key;
+            document.getElementById('var_value').value = val;
+            window.scrollTo({ top: 0, behavior: 'smooth' });
         }
-        
-        function copyApiUrl(url, button) {
-            navigator.clipboard.writeText(url).then(() => {
-                const originalHtml = button.innerHTML;
-                button.innerHTML = '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>';
-                button.classList.add('bg-green-500/20', 'text-green-400');
-                
-                setTimeout(() => {
-                    button.innerHTML = originalHtml;
-                    button.classList.remove('bg-green-500/20', 'text-green-400');
-                }, 2000);
-            }).catch(err => {
-                console.error('Failed to copy text: ', err);
-                alert('Failed to copy to clipboard.');
-            });
+
+        // Live Dynamic Refresh
+        function refreshTable() {
+            const table = document.getElementById('variables-table');
+            fetch('?refresh=1')
+                .then(res => res.text())
+                .then(html => {
+                    table.innerHTML = html;
+                    console.log("Table Sync Completed.");
+                });
         }
+
+        // Initialize SSE
+        const evtSource = new EventSource("events.php");
+        const dot = document.getElementById('sse-status');
+
+        evtSource.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            if (data.updated) {
+                refreshTable();
+                dot.classList.replace('bg-slate-600', 'bg-emerald-500');
+                setTimeout(() => dot.classList.replace('bg-emerald-500', 'bg-slate-600'), 1000);
+            }
+        };
+
+        evtSource.onerror = (err) => {
+            dot.classList.replace('bg-slate-600', 'bg-red-500');
+        };
     </script>
 </body>
 </html>
