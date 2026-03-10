@@ -1,18 +1,18 @@
 <?php
-/**
- * events.php - Server-Sent Events (SSE) Stream
- * Watches Redis for the 'last_update_time' key to notify dashboard clients.
- */
-
-header('Content-Type: text/event-stream');
-header('Cache-Control: no-cache');
-header('Connection: keep-alive');
-header('X-Accel-Buffering: no'); // Crucial for Nginx/CloudPanel real-time streaming
-
-// Redis connection
+// ==========================================
+// DUAL-LAYER VARIABLE STORAGE - SSE Stream
+// ==========================================
+// Redis configuration
 $redis_host = '127.0.0.1';
 $redis_port = 6379;
 
+// Nginx buffering bypass headers
+header('Content-Type: text/event-stream');
+header('Cache-Control: no-cache');
+header('Connection: keep-alive');
+header('X-Accel-Buffering: no'); 
+
+// Connect to Redis
 $redis = null;
 try {
     if (class_exists('Redis')) {
@@ -26,23 +26,32 @@ try {
 }
 
 if (!$redis) {
-    die("data: {\"error\": \"Redis unavailable\"}\n\n");
+    echo "event: error\ndata: Redis unavailable\n\n";
+    flush();
+    exit;
 }
 
-$last_seen = 0;
+// Track the last known update time sent to browser
+$lastReportedTime = $redis->get('tw_last_update_time') ?: 0;
 
-// Poll Redis in a loop
-while (true) {
+// SSE Loop
+while(true) {
     if (connection_aborted()) break;
 
-    $update_time = $redis->get('last_update_time');
+    $currentTime = $redis->get('tw_last_update_time');
 
-    if ($update_time && $update_time > $last_seen) {
-        $last_seen = $update_time;
-        echo "data: " . json_encode(['updated' => true, 'timestamp' => $update_time]) . "\n\n";
+    if ($currentTime && $currentTime > $lastReportedTime) {
+        $lastReportedTime = $currentTime;
+        echo "data: " . json_encode(['update' => true, 'timestamp' => $currentTime]) . "\n\n";
+        ob_flush();
+        flush();
     }
 
-    // Small sleep to prevent CPU spikes, but fast enough for "real-time" feel
-    flush(); 
-    usleep(250000); // 0.25 seconds
+    // Small keep-alive ping
+    echo ": ping\n\n";
+    ob_flush();
+    flush();
+
+    // Poll every 0.25s
+    usleep(250000); 
 }

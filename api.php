@@ -17,7 +17,7 @@ $redis_prefix = 'tw_var_'; // Prefix to avoid key collisions
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Methods: GET, POST, OPTIONS");
 header("Access-Control-Allow-Headers: Content-Type");
-header("X-Accel-Buffering: no"); // Prevent Nginx buffering for SSE/Live updates
+header("X-Accel-Buffering: no"); // Prevent Nginx buffering for real-time updates
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit(0);
@@ -34,7 +34,7 @@ try {
     die("fail");
 }
 
-// Connect to Redis
+// Connect to Redis (wrapped in try-catch to prevent crashing if not enabled)
 $redis = null;
 try {
     if (class_exists('Redis')) {
@@ -55,7 +55,7 @@ if (!$action || !$name) {
 }
 
 /**
- * Calculate size in bytes and return human-readable format
+ * Format bytes into human readable size
  */
 function getFormattedSize($string) {
     $bytes = strlen($string);
@@ -69,11 +69,11 @@ function getFormattedSize($string) {
 }
 
 /**
- * Trigger the update signal for SSE
+ * Notifies the dashboard of an update via Redis flag
  */
 function notifyUpdate($redis) {
     if ($redis) {
-        $redis->set('last_update_time', microtime(true));
+        $redis->set('tw_last_update_time', microtime(true));
     }
 }
 
@@ -104,11 +104,8 @@ function saveDualLayer($name, $value, $pdo, $redis, $redis_prefix) {
         
         if ($redis) {
             $redis->set($redis_prefix . $name, $value);
+            notifyUpdate($redis);
         }
-        
-        // Notify SSE stream
-        notifyUpdate($redis);
-        
         return true;
     } catch (Exception $e) {
         return false;
@@ -118,7 +115,7 @@ function saveDualLayer($name, $value, $pdo, $redis, $redis_prefix) {
 if ($action === 'pull') {
     $current_value = getCurrentValue($name, $pdo, $redis, $redis_prefix);
     
-    // Auto-heal redis cache
+    // Auto-heal redis cache if we pulled from fallback
     if ($redis) {
         $redis->set($redis_prefix . $name, $current_value);
     }
@@ -176,12 +173,8 @@ elseif ($action === 'replace') {
         
         $new_value = $prefix . $value . $suffix;
         
-        if (saveDualLayer($new_value, $new_value, $pdo, $redis, $redis_prefix)) {
-            // Wait, saveDualLayer expects $name, $value, ...
-        }
-        // Fixed below:
         if (saveDualLayer($name, $new_value, $pdo, $redis, $redis_prefix)) {
-             echo "success";
+            echo "success";
         } else {
             echo "fail";
         }
